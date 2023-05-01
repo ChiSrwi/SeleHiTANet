@@ -1,4 +1,4 @@
-# HiTANet
+# SeleHiTANet
 This is the code of SeleHiTANet.
  ## Requirements
  pytorch == 1.13.1\
