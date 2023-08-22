@@ -90,12 +90,14 @@ class PositionalWiseFeedForward(nn.Module):
         self.layer_norm = nn.LayerNorm(model_dim)
 
     def forward(self, x):
+        # print("x shape: ", x.shape)
         output = x.transpose(1, 2)
         output = self.w2(F.relu(self.w1(output)))
         output = self.dropout(output.transpose(1, 2))
 
         # add residual and norm layer
         output = self.layer_norm(x + output)
+        # print("output shape", output.shape)
         return output
 
 
@@ -124,12 +126,13 @@ class MultiHeadAttention(nn.Module):
         key = self.linear_k(key)
         value = self.linear_v(value)
         query = self.linear_q(query)
-
+        # print("key shape: ", key.shape)
         # split by heads
         key = key.view(batch_size * num_heads, -1, dim_per_head)
         value = value.view(batch_size * num_heads, -1, dim_per_head)
         query = query.view(batch_size * num_heads, -1, dim_per_head)
 
+        # print("key2 shape: ", key.shape)
         if attn_mask is not None:
             attn_mask = attn_mask.repeat(num_heads, 1, 1)
         # scaled dot product attention
@@ -165,7 +168,8 @@ class EncoderLayer(nn.Module):
 
         # feed forward network
         output = self.feed_forward(context)
-
+        # print("context shape",context.shape)
+        # print("attention shape", attention.shape)
         return output, attention
 
 
@@ -238,59 +242,70 @@ class EncoderNew(nn.Module):
                  model_dim=256,
                  num_heads=4,
                  ffn_dim=1024,
-                 dropout=0.0):
+                 dropout=0.0,
+                 dropout_emb=0.1):
         super(EncoderNew, self).__init__()
-
         self.encoder_layers = nn.ModuleList(
             [EncoderLayer(model_dim, num_heads, ffn_dim, dropout) for _ in
              range(num_layers)])
         self.pre_embedding = Embedding(vocab_size + 1, model_dim)
         self.bias_embedding = torch.nn.Parameter(torch.Tensor(model_dim))
-
-        self.vocab_size = vocab_size
-        self.target_embedding = nn.Embedding(1, model_dim)
-
-        
-        #test
-        self.embedding = nn.Embedding(vocab_size , model_dim, padding_idx=-1)
-        self.model_dim = model_dim
-        self.max_seq_len = max_seq_len
-
         bound = 1 / math.sqrt(vocab_size)
         init.uniform_(self.bias_embedding, -bound, bound)
+
+        self.vocab_size = vocab_size
+        self.target_embedding = Embedding(1, model_dim)
+        #test
+        self.embedding = Embedding(vocab_size+1, model_dim, padding_idx=-1)
+        self.model_dim = model_dim
+        self.max_seq_len = max_seq_len
+        self.emb_dropout = nn.Dropout(dropout_emb)
+        self.code_selection = nn.Sequential(nn.Linear(2*model_dim, model_dim), nn.Tanh(), nn.Linear(model_dim, 2))
+
+
 
         self.pos_embedding = PositionalEncoding(model_dim, max_seq_len)
         self.time_layer = torch.nn.Linear(64, 256)
         self.selection_layer = torch.nn.Linear(1, 64)
-
-        self.code_selection = nn.Sequential(nn.Linear(2*model_dim, model_dim), nn.Tanh(), nn.Linear(model_dim, 2))
-
         self.relu = nn.ReLU()
-        self.tanh = nn.Tanh()
+        self.tanh = nn.Tanh()    
+
 
     def forward(self, diagnosis_codes, mask, mask_code, seq_time_step, input_len):
-        
-        os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-
         seq_time_step = torch.Tensor(seq_time_step).cuda().unsqueeze(2) / 180
         time_feature = 1 - self.tanh(torch.pow(self.selection_layer(seq_time_step), 2))
         time_feature = self.time_layer(time_feature)
+
+        # print("diagnosis_codes, mask, mask_code, seq_time_step, input_len", diagnosis_codes.shape, mask.shape, mask_code.shape, seq_time_step.shape, input_len)
+        x = self.pre_embedding(diagnosis_codes)* mask_code
+        x = self.emb_dropout(x)
+        cat_features = torch.cat((self.embedding(torch.arange(0, self.vocab_size + 1).to(x.device)), 
+                                  self.target_embedding(x.new_zeros(self.vocab_size + 1).long())), dim=-1)
+        # print("self.pre_embedding(diagnosis_codes) shape:", self.embedding(diagnosis_codes.to(x.device)).shape)
         
-        output = (self.pre_embedding(diagnosis_codes) * mask_code).sum(dim=2) + self.bias_embedding
-        
-        cat_features = torch.cat((self.pre_embedding(torch.arange(0, self.vocab_size + 1).to(output.device)), self.target_embedding(output.new_zeros(self.vocab_size + 1).long())), dim=-1)
         p = self.code_selection(cat_features)
         p = F.gumbel_softmax(torch.log_softmax(p, -1), hard=True)
-        p_mask = p[:, 0].scatter_(dim=-1, index=torch.LongTensor([self.vocab_size]).to(output.device), src=torch.zeros(1).to(output.device))[diagnosis_codes]
-        select_mask_code = p_mask.unsqueeze(-1) * mask_code
-        
-        output = (self.pre_embedding(diagnosis_codes) * select_mask_code).sum(dim=2) + self.bias_embedding
+        p_mask = p[:, 0].scatter_(dim=0, index=torch.LongTensor([self.vocab_size]).to(x.device), src=torch.zeros(1).to(x.device))[diagnosis_codes]
+        # select_e = p_mask.unsqueeze(-1) * x
+        # with open("log.txt", "a") as f:
+        #     # f.write(str(self.embedding(torch.arange(0, self.vocab_size + 1).to(x.device)).shape))
+        #     # f.write("-----------------11--------\n")
+        #     f.write (str(self.embedding(torch.arange(0, self.vocab_size + 1).to(x.device))))
+        #     f.write("-----------------22--------\n")
+        #     # f.write(str(self.target_embedding(x.new_zeros(self.vocab_size + 1).long()).shape))
+        #     # f.write("-----------------33--------\n")
+        #     f.write(str(self.embedding(x.new_zeros(self.vocab_size + 1).long())))
+        #     f.write("-----------------44--------\n")
+        output = (x * p_mask.unsqueeze(-1)).sum(dim=2) + self.bias_embedding # Code Selection Mechanism
         output += time_feature
-
         output_pos, ind_pos = self.pos_embedding(input_len.unsqueeze(1))
         output += output_pos
-        self_attention_mask = padding_mask(ind_pos, ind_pos)
         
+        # print("diagnosis_codes:", diagnosis_codes.shape)
+        # print("mask_code shape:", mask_code.shape)
+        # print("self.pre_embedding(diagnosis_codes) shape:", (self.pre_embedding(diagnosis_codes) * mask_code).shape)
+        # print("output shape: ", output.shape)
+        self_attention_mask = padding_mask(ind_pos, ind_pos)
 
         attentions = []
         outputs = []
